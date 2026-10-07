@@ -1,0 +1,14 @@
+{
+  "keys": {
+    "vendor-sat-alpha-1": {
+      "algorithm": "Ed25519",
+      "deviceId": "sat-alpha",
+      "publicKeyBase64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc="
+    },
+    "vendor-sat-beta-1": {
+      "algorithm": "Ed25519",
+      "deviceId": "sat-beta",
+      "publicKeyBase64": "oJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPA="
+    }
+  }
+}

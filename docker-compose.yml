@@ -1,0 +1,44 @@
+services:
+  # Persistent API service.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: attestation-guard:latest
+    environment:
+      APP_PORT: "8080"
+      APP_HOST: "0.0.0.0"
+      DB_PATH: /data/attestations.db
+      KEYS_PATH: /app/deploy/keys.json
+      QUIET_LOGS: "1"
+    ports:
+      # Host-side port is controlled by the APP_PORT env var (.env / shell).
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - attest-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    restart: unless-stopped
+
+  # One-shot verification: build check + unit tests + signature-admission smoke.
+  # Runs to completion, never restarts, and exits with an aggregate status code.
+  # Invoke with:  docker compose run --build --rm verify
+  verify:
+    image: attestation-guard:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["sh", "scripts/verify.sh"]
+    environment:
+      QUIET_LOGS: "1"
+    restart: "no"
+    # Self-contained: the smoke test starts its own in-process server.
+    tmpfs:
+      - /data
+
+volumes:
+  attest-data:
