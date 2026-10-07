@@ -170,6 +170,48 @@ def main() -> int:
         dep_device = "smoke-dep"
         dep_cfg = b"dep-config-v1"
 
+        # --- stable rejected verdict: missing dependency, then retry ----
+        # A proof rejected because its dependency does not exist must keep
+        # replaying that rejection even after the dependency is admitted and
+        # the baseline would now be satisfied; the failed proof never creates
+        # or advances the target head.
+        replay_dep = "smoke-dep-replay"
+        replay_target = "smoke-target-replay"
+        replay_dep_cfg = b"dep-replay-v1"
+        replay_prereq = [{
+            "deviceId": replay_dep, "generation": 1,
+            "configSha256": hashlib.sha256(replay_dep_cfg).hexdigest()}]
+        env_replay = envelope(
+            "target-att-replay", replay_target, 1, 0, b"rep", replay_prereq)
+
+        status, body = request(port, "POST", "/api/attestations", env_replay)
+        check("rejected first: missing dependency -> 409",
+              status == 409 and body["error"]["code"] == "PREREQUISITE_NOT_SATISFIED",
+              f"{status} {body}")
+        status, body = request(port, "GET", f"/api/devices/{replay_target}/head")
+        check("rejected first: target left no head", status == 404, f"{status} {body}")
+
+        # dependency now exists at exactly the pinned generation/digest ...
+        status, body = request(
+            port, "POST", "/api/attestations",
+            envelope("dep-replay-1", replay_dep, 1, 0, replay_dep_cfg))
+        check("replay dependency admitted (201)", status == 201, f"{status} {body}")
+        # ... but the byte-identical proof replays the original rejection
+        status, body = request(port, "POST", "/api/attestations", env_replay)
+        check("same proof retried after dependency satisfied still 409",
+              status == 409 and body["error"]["code"] == "PREREQUISITE_NOT_SATISFIED",
+              f"{status} {body}")
+        status, body = request(port, "GET", f"/api/devices/{replay_target}/head")
+        check("rejected proof still advanced no head", status == 404, f"{status} {body}")
+        # same id with different signed content keeps the conflict rule
+        env_replay_other = envelope(
+            "target-att-replay", replay_target, 2, 0, b"rep-other", replay_prereq)
+        status, body = request(port, "POST", "/api/attestations", env_replay_other)
+        check("rejected id reused with different content -> conflict",
+              status == 409
+              and body["error"]["code"] == "ATTESTATION_ID_CONTENT_MISMATCH",
+              f"{status} {body}")
+
         # --- prerequisite success --------------------------------------
         status, body = request(
             port, "POST", "/api/attestations",
@@ -310,6 +352,17 @@ def main() -> int:
             status, body = request(port2, "GET", f"/api/devices/{failed_target}/head")
             check(f"failed target {failed_target} still absent after restart",
                   status == 404, f"{status} {body}")
+
+        # the proof rejected before its dependency existed keeps replaying the
+        # same rejection after a restart with the dependency satisfied
+        status, body = request(port2, "POST", "/api/attestations", env_replay)
+        check("rejected proof retried after restart still 409",
+              status == 409 and body["error"]["code"] == "PREREQUISITE_NOT_SATISFIED",
+              f"{status} {body}")
+        status, body = request(port2, "GET", f"/api/devices/{replay_target}/head")
+        check("rejected proof left no head after restart",
+              status == 404 and body["error"]["code"] == "DEVICE_NOT_FOUND",
+              f"{status} {body}")
 
         # unknown device
         status, body = request(port2, "GET", "/api/devices/unknown/head")

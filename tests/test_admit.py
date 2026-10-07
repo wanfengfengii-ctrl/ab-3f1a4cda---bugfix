@@ -291,8 +291,9 @@ class PrerequisiteCase(Case):
         self.assertFalse(d.accepted)
         self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
         self.assertIsNone(self.admitter.head("tgt"))
-        # both present and matching -> accepted
-        d = self.target("t-1", 1, 0, prereqs=[
+        # both present and matching -> accepted (a fresh attestation id; the
+        # rejected id t-1 retains its verdict and must replay as rejected)
+        d = self.target("t-2", 1, 0, prereqs=[
             {"deviceId": "dep-1", "generation": 1, "configSha256": digest(c1)},
             {"deviceId": "dep-2", "generation": 1, "configSha256": digest(c2)}])
         self.assertTrue(d.accepted, d)
@@ -334,18 +335,59 @@ class PrerequisiteCase(Case):
         # dependency untouched as well
         self.assertEqual(self.admitter.head("dep")["configSha256"], digest(b"dep-cfg-1"))
 
-    def test_failed_prerequisite_then_fixed_same_id_can_admit(self):
-        # dependency absent: the failed verdict stores neither the target row
-        # nor the attestation id ...
+    def test_rejected_prerequisite_same_id_replays_even_after_fixed(self):
+        # dependency absent: the rejected verdict stores no target row ...
+        prereq = [{"deviceId": "dep", "generation": 1,
+                   "configSha256": digest(b"dep-cfg-1")}]
+        d = self.target("t-1", 1, 0, prereqs=prereq)
+        self.assertEqual(d.status, 409)
+        self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
+        self.assertIsNone(self.admitter.head("tgt"))
+        # ... but the verdict is durable: once the formation baseline exists,
+        # the byte-identical request replays the original rejection instead of
+        # being re-adjudicated.
+        self.dep()
+        d = self.target("t-1", 1, 0, prereqs=prereq)
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.status, 409)
+        self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
+        # the rejected proof never created or advanced the target head
+        self.assertIsNone(self.admitter.head("tgt"))
+        self.assertEqual(self.store.accepted_generations("tgt"), [])
+        # a *different* proof under a fresh attestation id is admitted normally
+        d = self.target("t-2", 1, 0, prereqs=prereq)
+        self.assertTrue(d.accepted, d)
+        self.assertEqual(d.status, 201)
+        self.assertEqual(self.admitter.head("tgt")["generation"], 1)
+
+    def test_rejected_prerequisite_same_id_still_replays_after_restart(self):
         prereq = [{"deviceId": "dep", "generation": 1,
                    "configSha256": digest(b"dep-cfg-1")}]
         d = self.target("t-1", 1, 0, prereqs=prereq)
         self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
-        # ... so once the formation baseline exists, the same id is admitted
         self.dep()
-        d = self.target("t-1", 1, 0, prereqs=prereq)
-        self.assertTrue(d.accepted, d)
-        self.assertEqual(d.status, 201)
+        # brand new Store/Admitter over the same database, i.e. a restart
+        store2 = Store(self.db)
+        adm2 = Admitter(store2, {KEY_ID: PUB, KEY_ID2: PUB2},
+                        {KEY_ID: None, KEY_ID2: None})
+        payload = json.dumps({
+            "deviceId": "tgt",
+            "generation": 1,
+            "previousGeneration": 0,
+            "configSha256": digest(b"tgt-cfg"),
+            "prerequisites": prereq,
+        }, separators=(",", ":")).encode("utf-8")
+        sig = ed25519.sign(payload, SEED)
+        r = adm2.admit(
+            attestation_id="t-1",
+            key_id=KEY_ID,
+            payload_b64=base64.b64encode(payload).decode(),
+            signature_b64=base64.b64encode(sig).decode(),
+        )
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.status, 409)
+        self.assertEqual(r.code, "PREREQUISITE_NOT_SATISFIED")
+        self.assertIsNone(adm2.head("tgt"))
 
     # ----------------------------------------------------------------- replay
     def test_accepted_prerequisite_retry_replays_original(self):

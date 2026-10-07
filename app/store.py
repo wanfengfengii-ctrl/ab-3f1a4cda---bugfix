@@ -4,6 +4,11 @@ Write transactions use ``BEGIN IMMEDIATE`` so that concurrent submitters
 (threads or processes) are serialised by the database itself: the loser of a
 race re-reads the new head and is rejected as stale instead of forking the
 accepted chain.
+
+Every *rendered verdict* (acceptance or rejection) is additionally recorded in
+``attestation_verdicts`` keyed by ``attestationId``. A byte-identical retry
+therefore replays the first verdict forever, even if the external state that
+the first verdict depended on has since changed (or the service restarted).
 """
 
 from __future__ import annotations
@@ -26,6 +31,23 @@ CREATE TABLE IF NOT EXISTS attestations (
     accepted_at       TEXT    NOT NULL,
     PRIMARY KEY (device_id, generation),
     UNIQUE (attestation_id)
+);
+
+CREATE TABLE IF NOT EXISTS attestation_verdicts (
+    -- One row per attestationId: the first verdict rendered for a signed
+    -- request, retained so byte-identical retries replay it forever, even
+    -- after dependency/device state changes or a service restart.
+    attestation_id      TEXT    PRIMARY KEY,
+    payload_sha256      TEXT    NOT NULL,
+    accepted            INTEGER NOT NULL,
+    status              INTEGER NOT NULL,
+    code                TEXT    NOT NULL,
+    message             TEXT    NOT NULL,
+    device_id           TEXT,
+    generation          INTEGER,
+    previous_generation INTEGER,
+    config_sha256       TEXT,
+    accepted_at         TEXT
 );
 """
 
@@ -63,6 +85,49 @@ class StoredAttestation:
 
 class ConcurrentUpdateError(Exception):
     """Raised when the database cannot acquire the write lock in time."""
+
+
+class StoredVerdict:
+    """The first verdict ever rendered for an attestation id."""
+
+    __slots__ = (
+        "attestation_id",
+        "payload_sha256",
+        "accepted",
+        "status",
+        "code",
+        "message",
+        "device_id",
+        "generation",
+        "previous_generation",
+        "config_sha256",
+        "accepted_at",
+    )
+
+    def __init__(self, row: sqlite3.Row):
+        self.attestation_id = row["attestation_id"]
+        self.payload_sha256 = row["payload_sha256"]
+        self.accepted = bool(row["accepted"])
+        self.status = row["status"]
+        self.code = row["code"]
+        self.message = row["message"]
+        self.device_id = row["device_id"]
+        self.generation = row["generation"]
+        self.previous_generation = row["previous_generation"]
+        self.config_sha256 = row["config_sha256"]
+        self.accepted_at = row["accepted_at"]
+
+    def replay_record(self) -> Optional[dict]:
+        if not self.accepted:
+            return None
+        return {
+            "deviceId": self.device_id,
+            "generation": self.generation,
+            "previousGeneration": self.previous_generation,
+            "configSha256": self.config_sha256,
+            "attestationId": self.attestation_id,
+            "acceptedAt": self.accepted_at,
+        }
 
 
 class Store:
@@ -170,6 +235,52 @@ class Store:
             (attestation_id,),
         ).fetchone()
         return StoredAttestation(row) if row is not None else None
+
+    def find_verdict(
+        self, conn: sqlite3.Connection, attestation_id: str
+    ) -> Optional[StoredVerdict]:
+        """Look up the first verdict ever rendered for an attestation id."""
+        row = conn.execute(
+            "SELECT * FROM attestation_verdicts WHERE attestation_id = ?",
+            (attestation_id,),
+        ).fetchone()
+        return StoredVerdict(row) if row is not None else None
+
+    def insert_verdict(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        attestation_id: str,
+        payload_sha256: str,
+        accepted: bool,
+        status: int,
+        code: str,
+        message: str,
+        device_id: Optional[str] = None,
+        generation: Optional[int] = None,
+        previous_generation: Optional[int] = None,
+        config_sha256: Optional[str] = None,
+        accepted_at: Optional[str] = None,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO attestation_verdicts "
+            "(attestation_id, payload_sha256, accepted, status, code, message, "
+            " device_id, generation, previous_generation, config_sha256, accepted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attestation_id,
+                payload_sha256,
+                1 if accepted else 0,
+                status,
+                code,
+                message,
+                device_id,
+                generation,
+                previous_generation,
+                config_sha256,
+                accepted_at,
+            ),
+        )
 
     def head_unlocked(
         self, conn: sqlite3.Connection, device_id: str

@@ -196,6 +196,32 @@ class HttpCase(unittest.TestCase):
             status, _ = self.req("GET", f"/api/devices/{device}/head")
             self.assertEqual(status, 404)
 
+    def test_prerequisite_rejected_then_satisfied_still_replays(self):
+        # A proof whose dependency is missing is rejected first; its verdict
+        # is stable: after the dependency appears, a byte-identical retry must
+        # keep failing and never create the target head.
+        prereq = [{"deviceId": "dep-replay", "generation": 1,
+                   "configSha256": h(b"dep-replay-v1")}]
+        body = self._prereq_body(
+            "t-replay", "tgt-replay", 1, 0, b"c", prereq)
+        status, resp = self.req("POST", "/api/attestations", body)
+        self.assertEqual(status, 409, resp)
+        self.assertEqual(resp["error"]["code"], "PREREQUISITE_NOT_SATISFIED")
+        # dependency now satisfies the baseline
+        self._seed_dependency(device="dep-replay", config=b"dep-replay-v1")
+        # identical request replays the original rejection
+        status, resp = self.req("POST", "/api/attestations", body)
+        self.assertEqual(status, 409, resp)
+        self.assertEqual(resp["error"]["code"], "PREREQUISITE_NOT_SATISFIED")
+        status, head = self.req("GET", "/api/devices/tgt-replay/head")
+        self.assertEqual(status, 404)
+        self.assertEqual(head["error"]["code"], "DEVICE_NOT_FOUND")
+        # a different proof under a fresh id is admitted normally
+        other = self._prereq_body(
+            "t-replay-2", "tgt-replay", 1, 0, b"c", prereq)
+        status, resp = self.req("POST", "/api/attestations", other)
+        self.assertEqual(status, 201, resp)
+
     def test_prerequisite_retry_replays_after_dependency_advances(self):
         self._seed_dependency(device="dep-r", config=b"r1")
         prereq = [{"deviceId": "dep-r", "generation": 1, "configSha256": h(b"r1")}]

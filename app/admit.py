@@ -22,9 +22,18 @@ target then fails with ``PREREQUISITE_NOT_SATISFIED``) or after it (the target
 was admitted against a still-valid formation baseline). A failed prerequisite
 never advances the target device.
 
-Retries (same attestation id byte-for-byte) replay the original outcome and
-never mutate state. A reused id with different content, a stale predecessor,
-or a generation that does not advance is a conflict and leaves state untouched.
+Stable verdicts
+---------------
+The first verdict rendered for an ``attestationId`` is durably recorded,
+whether it is an acceptance or a rejection. A later byte-identical request
+replays that first verdict forever: an accepted proof replays as ``200``
+without re-evaluating anything, and a rejected proof (e.g. one whose
+prerequisite was missing) keeps returning the same HTTP status and stable
+error code even after the dependency device, the target device, or any other
+external state has changed, and after a service restart. A reused id with
+different signed content is always ``ATTESTATION_ID_CONTENT_MISMATCH``. A
+stale predecessor or a generation that does not advance likewise leaves state
+untouched.
 """
 
 from __future__ import annotations
@@ -249,6 +258,37 @@ class Admitter:
             prerequisites=doc.get("prerequisites") or [],
         )
 
+    def _record_rejection(
+        self,
+        conn,
+        *,
+        attestation_id: str,
+        payload_sha: str,
+        device_id: str,
+        generation: int,
+        previous_generation: int,
+        config_sha256: str,
+        status: int,
+        code: str,
+        message: str,
+    ) -> AdmissionDecision:
+        """Persist a freshly rendered rejection so identical retries replay it."""
+        self.store.insert_verdict(
+            conn,
+            attestation_id=attestation_id,
+            payload_sha256=payload_sha,
+            accepted=False,
+            status=status,
+            code=code,
+            message=message,
+            device_id=device_id,
+            generation=generation,
+            previous_generation=previous_generation,
+            config_sha256=config_sha256,
+            accepted_at=None,
+        )
+        return AdmissionDecision(False, status, code, message)
+
     def _persist(
         self,
         *,
@@ -264,71 +304,137 @@ class Admitter:
 
         try:
             with self.store.transaction() as conn:
-                existing_id = self.store.find_by_id(conn, attestation_id)
-                prior = self.store.find(conn, device_id, generation)
+                verdict = self.store.find_verdict(conn, attestation_id)
 
-                # 1) Exact retry: same id AND byte-identical signed payload.
-                if existing_id is not None and existing_id.payload_sha256 == payload_sha:
-                    if existing_id.device_id != device_id:
+                # 1) This id already has a recorded verdict. Byte-identical
+                #    requests replay that verdict forever without
+                #    re-evaluating signatures' downstream state (chain, heads,
+                #    prerequisites); a different signed payload conflicts.
+                if verdict is not None:
+                    if verdict.payload_sha256 != payload_sha:
                         return AdmissionDecision(
                             False, 409, ERR_ID_CONTENT_MISMATCH,
-                            "attestationId already used for different content",
+                            "attestationId was already used with different content",
                         )
+                    if verdict.accepted:
+                        return AdmissionDecision(
+                            True, 200, "",
+                            "attestation already accepted",
+                            record=verdict.replay_record(), duplicate=True,
+                        )
+                    return AdmissionDecision(
+                        False, verdict.status, verdict.code, verdict.message
+                    )
+
+                # Legacy databases may hold an accepted row written before the
+                # verdict registry existed: treat it as a recorded acceptance
+                # (backfilling the registry) or as an id/content conflict.
+                legacy = self.store.find_by_id(conn, attestation_id)
+                if legacy is not None:
+                    if legacy.payload_sha256 != payload_sha:
+                        return AdmissionDecision(
+                            False, 409, ERR_ID_CONTENT_MISMATCH,
+                            "attestationId was already used with different content",
+                        )
+                    self.store.insert_verdict(
+                        conn,
+                        attestation_id=attestation_id,
+                        payload_sha256=payload_sha,
+                        accepted=True,
+                        status=201,
+                        code="",
+                        message="attestation accepted",
+                        device_id=legacy.device_id,
+                        generation=legacy.generation,
+                        previous_generation=legacy.previous_generation,
+                        config_sha256=legacy.config_sha256,
+                        accepted_at=legacy.accepted_at,
+                    )
                     return AdmissionDecision(
                         True, 200, "",
                         "attestation already accepted",
-                        record=existing_id.to_dict(), duplicate=True,
+                        record=legacy.to_dict(), duplicate=True,
                     )
 
-                # 2) Reused attestation id with different signed content.
-                if existing_id is not None:
-                    return AdmissionDecision(
-                        False, 409, ERR_ID_CONTENT_MISMATCH,
-                        "attestationId was already used with different content",
-                    )
-
-                # 3) Same generation number already accepted -> content must match.
+                # 2) Same generation number already accepted -> content must match.
+                prior = self.store.find(conn, device_id, generation)
                 if prior is not None:
-                    return AdmissionDecision(
-                        False, 409, ERR_GENERATION_CONTENT_MISMATCH,
-                        f"generation {generation} for device {device_id!r} is "
-                        "already accepted with different content",
+                    return self._record_rejection(
+                        conn,
+                        attestation_id=attestation_id, payload_sha=payload_sha,
+                        device_id=device_id, generation=generation,
+                        previous_generation=previous_generation,
+                        config_sha256=config_sha256,
+                        status=409, code=ERR_GENERATION_CONTENT_MISMATCH,
+                        message=(
+                            f"generation {generation} for device {device_id!r} is "
+                            "already accepted with different content"
+                        ),
                     )
 
-                # 4) Chain / predecessor rules evaluated against the locked head.
+                # 3) Chain / predecessor rules evaluated against the locked head.
                 head = self.store.head_unlocked(conn, device_id)
                 if head is None:
                     if previous_generation != 0:
-                        return AdmissionDecision(
-                            False, 409, ERR_BAD_PREDECESSOR_FIRST,
-                            f"first attestation for device {device_id!r} must "
-                            f"have previousGeneration 0 (got {previous_generation})",
+                        return self._record_rejection(
+                            conn,
+                            attestation_id=attestation_id, payload_sha=payload_sha,
+                            device_id=device_id, generation=generation,
+                            previous_generation=previous_generation,
+                            config_sha256=config_sha256,
+                            status=409, code=ERR_BAD_PREDECESSOR_FIRST,
+                            message=(
+                                f"first attestation for device {device_id!r} must "
+                                f"have previousGeneration 0 (got {previous_generation})"
+                            ),
                         )
                     if generation == 0:
-                        return AdmissionDecision(
-                            False, 409, ERR_GEN_ZERO,
-                            "generation must be greater than 0",
+                        return self._record_rejection(
+                            conn,
+                            attestation_id=attestation_id, payload_sha=payload_sha,
+                            device_id=device_id, generation=generation,
+                            previous_generation=previous_generation,
+                            config_sha256=config_sha256,
+                            status=409, code=ERR_GEN_ZERO,
+                            message="generation must be greater than 0",
                         )
                 else:
                     if previous_generation != head.generation:
-                        return AdmissionDecision(
-                            False, 409, ERR_STALE_PREDECESSOR,
-                            f"previousGeneration {previous_generation} does not "
-                            f"match current head generation {head.generation}",
+                        return self._record_rejection(
+                            conn,
+                            attestation_id=attestation_id, payload_sha=payload_sha,
+                            device_id=device_id, generation=generation,
+                            previous_generation=previous_generation,
+                            config_sha256=config_sha256,
+                            status=409, code=ERR_STALE_PREDECESSOR,
+                            message=(
+                                f"previousGeneration {previous_generation} does not "
+                                f"match current head generation {head.generation}"
+                            ),
                         )
                     if generation <= head.generation:
-                        return AdmissionDecision(
-                            False, 409, ERR_GEN_NOT_GREATER,
-                            f"generation {generation} must be greater than "
-                            f"current head {head.generation}",
+                        return self._record_rejection(
+                            conn,
+                            attestation_id=attestation_id, payload_sha=payload_sha,
+                            device_id=device_id, generation=generation,
+                            previous_generation=previous_generation,
+                            config_sha256=config_sha256,
+                            status=409, code=ERR_GEN_NOT_GREATER,
+                            message=(
+                                f"generation {generation} must be greater than "
+                                f"current head {head.generation}"
+                            ),
                         )
 
-                # 5) Formation prerequisites, evaluated against the locked
+                # 4) Formation prerequisites, evaluated against the locked
                 #    heads of the dependency devices *inside this same write
                 #    transaction*. Each dependency must exist and its current
                 #    head must match both the stated generation and the stated
-                #    config digest exactly. Failure aborts the transaction, so
-                #    the target row is never written and no state advances.
+                #    config digest exactly. Failure aborts the chain insert
+                #    but records the rejection verdict, so the target row is
+                #    never written, no state advances, and an identical retry
+                #    replays this same failure even if the baseline later
+                #    becomes satisfiable.
                 for prereq in prerequisites:
                     dep_head = self.store.head_unlocked(conn, prereq["deviceId"])
                     expected_gen = prereq["generation"]
@@ -347,12 +453,20 @@ class Admitter:
                             )
                         else:
                             detail = "head config digest differs from the prerequisite"
-                        return AdmissionDecision(
-                            False, 409, ERR_PREREQUISITE,
-                            f"prerequisite on device {prereq['deviceId']!r} is not "
-                            f"satisfied: {detail}",
+                        return self._record_rejection(
+                            conn,
+                            attestation_id=attestation_id, payload_sha=payload_sha,
+                            device_id=device_id, generation=generation,
+                            previous_generation=previous_generation,
+                            config_sha256=config_sha256,
+                            status=409, code=ERR_PREREQUISITE,
+                            message=(
+                                f"prerequisite on device {prereq['deviceId']!r} is not "
+                                f"satisfied: {detail}"
+                            ),
                         )
 
+                accepted_at = _now()
                 self.store.insert(
                     conn,
                     device_id=device_id,
@@ -361,7 +475,21 @@ class Admitter:
                     config_sha256=config_sha256,
                     attestation_id=attestation_id,
                     payload_sha256=payload_sha,
-                    accepted_at=_now(),
+                    accepted_at=accepted_at,
+                )
+                self.store.insert_verdict(
+                    conn,
+                    attestation_id=attestation_id,
+                    payload_sha256=payload_sha,
+                    accepted=True,
+                    status=201,
+                    code="",
+                    message="attestation accepted",
+                    device_id=device_id,
+                    generation=generation,
+                    previous_generation=previous_generation,
+                    config_sha256=config_sha256,
+                    accepted_at=accepted_at,
                 )
                 rec = self.store.find(conn, device_id, generation)
                 return AdmissionDecision(
