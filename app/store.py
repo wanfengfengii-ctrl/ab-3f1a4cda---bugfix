@@ -27,6 +27,14 @@ CREATE TABLE IF NOT EXISTS attestations (
     PRIMARY KEY (device_id, generation),
     UNIQUE (attestation_id)
 );
+
+CREATE TABLE IF NOT EXISTS admission_decisions (
+    attestation_id    TEXT    NOT NULL PRIMARY KEY,
+    payload_sha256    TEXT    NOT NULL,
+    accepted          INTEGER NOT NULL,
+    status_code       INTEGER NOT NULL,
+    error_code        TEXT    NOT NULL
+);
 """
 
 
@@ -74,6 +82,14 @@ class Store:
         self._busy_timeout = busy_timeout_ms
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            # Backfill durable verdicts for attestations accepted by an older
+            # release that had no decision ledger, so their retries keep
+            # replaying the original 200/duplicate outcome after an upgrade.
+            conn.execute(
+                "INSERT OR IGNORE INTO admission_decisions "
+                "(attestation_id, payload_sha256, accepted, status_code, error_code) "
+                "SELECT attestation_id, payload_sha256, 1, 201, '' FROM attestations"
+            )
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -170,6 +186,35 @@ class Store:
             (attestation_id,),
         ).fetchone()
         return StoredAttestation(row) if row is not None else None
+
+    # ------------------------------------------------------- decision ledger
+    def find_decision(
+        self, conn: sqlite3.Connection, attestation_id: str
+    ) -> Optional[sqlite3.Row]:
+        """Return the durable verdict for an id (accepted or rejected)."""
+        return conn.execute(
+            "SELECT attestation_id, payload_sha256, accepted, status_code, error_code "
+            "FROM admission_decisions WHERE attestation_id = ?",
+            (attestation_id,),
+        ).fetchone()
+
+    def insert_decision(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        attestation_id: str,
+        payload_sha: str,
+        accepted: bool,
+        status_code: int,
+        error_code: str,
+    ) -> None:
+        """Persist a verdict so byte-identical retries replay it forever."""
+        conn.execute(
+            "INSERT INTO admission_decisions "
+            "(attestation_id, payload_sha256, accepted, status_code, error_code) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (attestation_id, payload_sha, 1 if accepted else 0, status_code, error_code),
+        )
 
     def head_unlocked(
         self, conn: sqlite3.Connection, device_id: str

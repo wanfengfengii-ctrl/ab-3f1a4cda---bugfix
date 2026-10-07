@@ -261,6 +261,29 @@ class Case(unittest.TestCase):
         self.assertEqual(len(self.store.accepted_generations("dev")), 1)
 
 
+    def test_decision_ledger_backfilled_for_pre_upgrade_acceptance(self):
+        # An attestation accepted by an older release exists in attestations
+        # but not in the decision ledger; reopening the store must backfill it
+        # so the identical retry still replays 200/duplicate.
+        d1, payload, sig = self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.assertEqual(d1.status, 201)
+        import sqlite3
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("DELETE FROM admission_decisions")
+            conn.commit()
+        store2 = Store(self.db)
+        adm2 = Admitter(store2, {KEY_ID: PUB}, {KEY_ID: None})
+        r = adm2.admit(
+            attestation_id="a1",
+            key_id=KEY_ID,
+            payload_b64=base64.b64encode(payload).decode(),
+            signature_b64=base64.b64encode(sig).decode(),
+        )
+        self.assertTrue(r.accepted)
+        self.assertEqual(r.status, 200)
+        self.assertTrue(r.duplicate)
+
+
 class PrerequisiteCase(Case):
     """Formation prerequisite: dependency heads gate target admission."""
 
@@ -292,7 +315,7 @@ class PrerequisiteCase(Case):
         self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
         self.assertIsNone(self.admitter.head("tgt"))
         # both present and matching -> accepted
-        d = self.target("t-1", 1, 0, prereqs=[
+        d = self.target("t-2", 1, 0, prereqs=[
             {"deviceId": "dep-1", "generation": 1, "configSha256": digest(c1)},
             {"deviceId": "dep-2", "generation": 1, "configSha256": digest(c2)}])
         self.assertTrue(d.accepted, d)
@@ -334,18 +357,65 @@ class PrerequisiteCase(Case):
         # dependency untouched as well
         self.assertEqual(self.admitter.head("dep")["configSha256"], digest(b"dep-cfg-1"))
 
-    def test_failed_prerequisite_then_fixed_same_id_can_admit(self):
-        # dependency absent: the failed verdict stores neither the target row
-        # nor the attestation id ...
+    def test_failed_prerequisite_verdict_is_replayed_after_baseline_appears(self):
+        # The dependency is absent on the first submission, so the target is
+        # rejected. That verdict is durable: neither admitting the dependency
+        # nor restarting the service may ever turn this identical request into
+        # an acceptance, and no target head is ever created.
+        prereq = [{"deviceId": "dep", "generation": 1,
+                   "configSha256": digest(b"dep-cfg-1")}]
+        d = self.target("t-1", 1, 0, prereqs=prereq)
+        self.assertEqual(d.status, 409)
+        self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
+        self.assertIsNone(self.admitter.head("tgt"))
+        self.assertEqual(self.store.accepted_generations("tgt"), [])
+
+        # baseline now satisfied ...
+        self.dep()
+        # ... but the byte-identical request replays the original rejection
+        d = self.target("t-1", 1, 0, prereqs=prereq)
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.status, 409)
+        self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
+        self.assertFalse(d.duplicate)
+        self.assertIsNone(self.admitter.head("tgt"))
+        self.assertEqual(self.store.accepted_generations("tgt"), [])
+
+        # ... and keeps replaying it after a restart (fresh Store/Admitter).
+        store2 = Store(self.db)
+        adm2 = Admitter(store2, {KEY_ID: PUB}, {KEY_ID: None})
+        raw = json.dumps({
+            "deviceId": "tgt",
+            "generation": 1,
+            "previousGeneration": 0,
+            "configSha256": digest(b"tgt-cfg"),
+            "prerequisites": prereq,
+        }, separators=(",", ":")).encode()
+        sig = ed25519.sign(raw, SEED)
+        d = adm2.admit(
+            "t-1", KEY_ID,
+            base64.b64encode(raw).decode(),
+            base64.b64encode(sig).decode(),
+        )
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.status, 409)
+        self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
+        self.assertIsNone(adm2.head("tgt"))
+        self.assertEqual(store2.accepted_generations("tgt"), [])
+
+    def test_rejected_verdict_id_with_different_content_still_conflicts(self):
         prereq = [{"deviceId": "dep", "generation": 1,
                    "configSha256": digest(b"dep-cfg-1")}]
         d = self.target("t-1", 1, 0, prereqs=prereq)
         self.assertEqual(d.code, "PREREQUISITE_NOT_SATISFIED")
-        # ... so once the formation baseline exists, the same id is admitted
+        # same id, different signed content (even once the baseline exists)
         self.dep()
-        d = self.target("t-1", 1, 0, prereqs=prereq)
-        self.assertTrue(d.accepted, d)
-        self.assertEqual(d.status, 201)
+        d = self.target("t-1", 1, 0, config=b"tgt-cfg-DIFFERENT", prereqs=prereq)
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.status, 409)
+        self.assertEqual(d.code, "ATTESTATION_ID_CONTENT_MISMATCH")
+        self.assertIsNone(self.admitter.head("tgt"))
+
 
     # ----------------------------------------------------------------- replay
     def test_accepted_prerequisite_retry_replays_original(self):

@@ -173,6 +173,30 @@ class HttpCase(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(resp["error"]["code"], "DEVICE_NOT_FOUND")
 
+    def test_rejected_prerequisite_replays_after_dependency_appears(self):
+        # First adjudication with the dependency absent -> 409.
+        body = self._prereq_body("t-fix", "tgt-fix", 1, 0, b"c", [
+            {"deviceId": "dep-fix", "generation": 1, "configSha256": h(b"dep-v1")}])
+        status, resp = self.req("POST", "/api/attestations", body)
+        self.assertEqual(status, 409)
+        self.assertEqual(resp["error"]["code"], "PREREQUISITE_NOT_SATISFIED")
+        # The dependency is then admitted at the exact pinned baseline.
+        self._seed_dependency(device="dep-fix", config=b"dep-v1")
+        # The byte-identical request must replay the original rejection ...
+        status, resp = self.req("POST", "/api/attestations", body)
+        self.assertEqual(status, 409, resp)
+        self.assertEqual(resp["error"]["code"], "PREREQUISITE_NOT_SATISFIED")
+        # ... without ever creating the target head.
+        status, resp = self.req("GET", "/api/devices/tgt-fix/head")
+        self.assertEqual(status, 404)
+        self.assertEqual(resp["error"]["code"], "DEVICE_NOT_FOUND")
+        # The same id carrying different content keeps the conflict rule.
+        other = self._prereq_body("t-fix", "tgt-fix", 1, 0, b"c-other", [
+            {"deviceId": "dep-fix", "generation": 1, "configSha256": h(b"dep-v1")}])
+        status, resp = self.req("POST", "/api/attestations", other)
+        self.assertEqual(status, 409)
+        self.assertEqual(resp["error"]["code"], "ATTESTATION_ID_CONTENT_MISMATCH")
+
     def test_prerequisite_version_and_digest_mismatch_over_http(self):
         self._seed_dependency(device="dep-vm", config=b"dep-v1",
                               att_id="dep-vm-1")

@@ -202,6 +202,41 @@ def main() -> int:
               status == 404 and body["error"]["code"] == "DEVICE_NOT_FOUND",
               f"{status} {body}")
 
+        # --- rejection stays a rejection once the environment changes ----
+        # The dependency device does not exist yet: first verdict is 409.
+        # After the dependency is admitted at the exact pinned baseline, the
+        # byte-identical request must still replay the original 409 (it is
+        # replayed again against a restarted server below).
+        fix_dep = "smoke-dep-fix"
+        fix_cfg = b"dep-fix-v1"
+        fix_prereq = [{"deviceId": fix_dep, "generation": 1,
+                       "configSha256": hashlib.sha256(fix_cfg).hexdigest()}]
+        env_fixed = envelope(
+            "target-att-fixed", "smoke-target-fixed", 1, 0, b"f", fix_prereq)
+        status, body = request(port, "POST", "/api/attestations", env_fixed)
+        check("absent dependency -> PREREQUISITE_NOT_SATISFIED",
+              status == 409 and body["error"]["code"] == "PREREQUISITE_NOT_SATISFIED",
+              f"{status} {body}")
+        status, body = request(
+            port, "POST", "/api/attestations",
+            envelope("dep-fix-att-1", fix_dep, 1, 0, fix_cfg))
+        check("fix dependency admitted (201)", status == 201, f"{status} {body}")
+        status, body = request(port, "POST", "/api/attestations", env_fixed)
+        check("identical retry replays the rejection after baseline appears",
+              status == 409 and body["error"]["code"] == "PREREQUISITE_NOT_SATISFIED",
+              f"{status} {body}")
+        status, body = request(port, "GET", "/api/devices/smoke-target-fixed/head")
+        check("replayed rejection never created a target head",
+              status == 404 and body["error"]["code"] == "DEVICE_NOT_FOUND",
+              f"{status} {body}")
+        # same id with different content keeps following the conflict rule
+        env_fixed_other = envelope(
+            "target-att-fixed", "smoke-target-fixed", 1, 0, b"f-different", fix_prereq)
+        status, body = request(port, "POST", "/api/attestations", env_fixed_other)
+        check("rejected id with new content -> ATTESTATION_ID_CONTENT_MISMATCH",
+              status == 409 and body["error"]["code"] == "ATTESTATION_ID_CONTENT_MISMATCH",
+              f"{status} {body}")
+
         # --- prerequisite version/digest mismatch ----------------------
         # concurrent race first (below) advances the dependency to gen 2;
         # both the stale-generation and wrong-digest pins must then fail.
@@ -306,10 +341,23 @@ def main() -> int:
             "smoke-target-missing",
             "smoke-target-stale",
             "smoke-target-wrongdigest",
+            "smoke-target-fixed",
         ):
             status, body = request(port2, "GET", f"/api/devices/{failed_target}/head")
             check(f"failed target {failed_target} still absent after restart",
                   status == 404, f"{status} {body}")
+
+        # the rejection recorded before the dependency existed still replays
+        # as the original 409 after a restart, despite the now-satisfied
+        # baseline, and never creates or advances the target head
+        status, body = request(port2, "POST", "/api/attestations", env_fixed)
+        check("rejection replays after restart despite satisfied baseline",
+              status == 409 and body["error"]["code"] == "PREREQUISITE_NOT_SATISFIED",
+              f"{status} {body}")
+        status, body = request(port2, "GET", "/api/devices/smoke-target-fixed/head")
+        check("replayed rejection left no head after restart",
+              status == 404 and body["error"]["code"] == "DEVICE_NOT_FOUND",
+              f"{status} {body}")
 
         # unknown device
         status, body = request(port2, "GET", "/api/devices/unknown/head")
